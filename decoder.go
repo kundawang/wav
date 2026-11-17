@@ -42,6 +42,17 @@ type Decoder struct {
 	PCMChunk *riff.Chunk
 	// Metadata for the current file
 	Metadata *Metadata
+
+	// containerDetected is set once the container format (RIFF or WAVE64)
+	// has been identified.
+	containerDetected bool
+	// isWave64 is set when the underlying container is WAVE64 instead of
+	// RIFF/WAVE.
+	isWave64 bool
+	// w64Size is the declared size of the WAVE64 container, header included.
+	w64Size uint64
+	// w64NextChunkOff is the absolute offset of the next WAVE64 chunk header.
+	w64NextChunkOff int64
 }
 
 // NewDecoder creates a decoder for the passed wav reader.
@@ -72,6 +83,10 @@ func (d *Decoder) Rewind() error {
 	d.PCMChunk = nil
 	d.err = nil
 	d.NumChans = 0
+	d.containerDetected = false
+	d.isWave64 = false
+	d.w64Size = 0
+	d.w64NextChunkOff = 0
 	err = d.FwdToPCM()
 	if err != nil {
 		return fmt.Errorf("failed to seek to the PCM data: %w", err)
@@ -152,7 +167,11 @@ func (d *Decoder) ReadMetadata() {
 		err   error
 	)
 	for err == nil {
-		chunk, err = d.parser.NextChunk()
+		if d.isWave64 {
+			chunk, err = d.NextChunk()
+		} else {
+			chunk, err = d.parser.NextChunk()
+		}
 		if err != nil {
 			break
 		}
@@ -203,6 +222,9 @@ func (d *Decoder) FwdToPCM() error {
 	for d.err == nil {
 		chunk, d.err = d.NextChunk()
 		if d.err != nil {
+			if d.isWave64 && errors.Is(d.err, io.EOF) {
+				d.err = fmt.Errorf("wave64: %w", ErrPCMChunkNotFound)
+			}
 			return d.err
 		}
 		if chunk.ID == riff.DataFormatID {
@@ -366,6 +388,15 @@ func (d *Decoder) NextChunk() (*riff.Chunk, error) {
 		return nil, d.err
 	}
 
+	if d.isWave64 {
+		var c *riff.Chunk
+		c, d.err = d.nextWave64Chunk()
+		if d.err != nil {
+			return nil, d.err
+		}
+		return c, nil
+	}
+
 	var (
 		id   [4]byte
 		size uint32
@@ -401,6 +432,18 @@ func (d *Decoder) Duration() (time.Duration, error) {
 	if d == nil || d.parser == nil {
 		return 0, errors.New("can't calculate the duration of a nil pointer")
 	}
+	if err := d.detectContainer(); err != nil {
+		return 0, err
+	}
+	if d.isWave64 {
+		if err := d.readWave64Headers(); err != nil {
+			return 0, err
+		}
+		if d.AvgBytesPerSec == 0 {
+			return 0, errors.New("wave64: can't calculate the duration, the average bytes per second is unknown")
+		}
+		return time.Duration((float64(d.w64Size) / float64(d.AvgBytesPerSec)) * float64(time.Second)), nil
+	}
 	return d.parser.Duration()
 }
 
@@ -413,6 +456,13 @@ func (d *Decoder) String() string {
 func (d *Decoder) readHeaders() error {
 	if d == nil || d.NumChans > 0 {
 		return nil
+	}
+
+	if err := d.detectContainer(); err != nil {
+		return err
+	}
+	if d.isWave64 {
+		return d.readWave64Headers()
 	}
 
 	id, size, err := d.parser.IDnSize()
