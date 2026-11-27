@@ -50,6 +50,9 @@ type Metadata struct {
 	TrackNbr string
 	// CuePoints is a list of cue points in the wav file.
 	CuePoints []*CuePoint
+	// ADM holds the Audio Definition Model channel mapping (chna chunk) and
+	// raw XML metadata (axml chunk) of immersive audio files.
+	ADM *ADMMetadata
 }
 
 // SamplerInfo is extra metadata pertinent to a sampler type usage.

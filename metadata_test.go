@@ -16,11 +16,13 @@ func TestDecoder_ReadMetadata(t *testing.T) {
 			metadata: &Metadata{
 				Artist: "artist", Title: "track title", Product: "album title",
 				TrackNbr: "42", CreationDate: "2017", Genre: "genre", Comments: "my comment",
+				ADM: nil,
 			},
 		},
 		{in: "fixtures/kick.wav"},
 		{in: "fixtures/flloop.wav", metadata: &Metadata{
 			Software: "FL Studio (beta)",
+			ADM:      nil,
 			CuePoints: []*CuePoint{
 				0:  {ID: [4]uint8{0x1, 0x0, 0x0, 0x0}, Position: 0x0, DataChunkID: [4]uint8{'d', 'a', 't', 'a'}},
 				1:  {ID: [4]uint8{0x2, 0x0, 0x0, 0x0}, Position: 0x1a5e, DataChunkID: [4]uint8{'d', 'a', 't', 'a'}, SampleOffset: 0x1a5e},

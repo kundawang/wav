@@ -233,6 +233,41 @@ func (e *Encoder) writeMetadata() error {
 	return e.AddBE(chunkData)
 }
 
+// writeADMMetadata validates and serializes the ADM chna and axml chunks.
+// The chunks are written at the end of the file, after the PCM data, so their
+// presence and relative order never affect the PCM stream.
+func (e *Encoder) writeADMMetadata() error {
+	adm := e.Metadata.ADM
+	if adm == nil {
+		return nil
+	}
+	if err := validateADM(adm, e.NumChans); err != nil {
+		return err
+	}
+
+	// The axml chunk precedes the chna chunk per the ADM authoring guidelines.
+	if len(adm.AXML) > 0 {
+		chunk, err := encodeAXMLChunk(adm.AXML)
+		if err != nil {
+			return err
+		}
+		if _, err := e.w.Write(chunk); err != nil {
+			return fmt.Errorf("failed to write the axml chunk: %w", err)
+		}
+		e.WrittenBytes += len(chunk)
+	}
+
+	chunk, err := encodeChnaChunk(adm)
+	if err != nil {
+		return err
+	}
+	if _, err := e.w.Write(chunk); err != nil {
+		return fmt.Errorf("failed to write the chna chunk: %w", err)
+	}
+	e.WrittenBytes += len(chunk)
+	return nil
+}
+
 // Close flushes the content to disk, make sure the headers are up to date
 // Note that the underlying writer is NOT being closed.
 func (e *Encoder) Close() error {
@@ -245,6 +280,9 @@ func (e *Encoder) Close() error {
 	if e.Metadata != nil {
 		if err := e.writeMetadata(); err != nil {
 			return fmt.Errorf("failed to write metadata - %w", err)
+		}
+		if err := e.writeADMMetadata(); err != nil {
+			return fmt.Errorf("failed to write ADM metadata - %w", err)
 		}
 	}
 

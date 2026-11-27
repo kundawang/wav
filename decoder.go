@@ -181,6 +181,18 @@ func (d *Decoder) ReadMetadata() {
 					d.err = err
 				}
 			}
+		case CIDChna:
+			if err = DecodeChnaChunk(d, chunk); err != nil {
+				if !errors.Is(err, io.EOF) {
+					d.err = err
+				}
+			}
+		case CIDAxml:
+			if err = DecodeAXMLChunk(d, chunk); err != nil {
+				if !errors.Is(err, io.EOF) {
+					d.err = err
+				}
+			}
 		default:
 			// fmt.Println(string(chunk.ID[:]))
 			chunk.Drain()
@@ -213,6 +225,16 @@ func (d *Decoder) FwdToPCM() error {
 		}
 		if chunk.ID == CIDList {
 			DecodeListChunk(d, chunk)
+		}
+		if chunk.ID == CIDChna {
+			if err := DecodeChnaChunk(d, chunk); err != nil {
+				return err
+			}
+		}
+		if chunk.ID == CIDAxml {
+			if err := DecodeAXMLChunk(d, chunk); err != nil {
+				return err
+			}
 		}
 		chunk.Drain()
 	}
@@ -459,6 +481,16 @@ func (d *Decoder) readHeaders() error {
 			rewindBytes += int64(chunk.Size) + 8
 		} else if chunk.ID == CIDSmpl {
 			DecodeSamplerChunk(d, chunk)
+			rewindBytes += int64(chunk.Size) + 8
+		} else if chunk.ID == CIDChna {
+			if err = DecodeChnaChunk(d, chunk); err != nil {
+				return err
+			}
+			rewindBytes += int64(chunk.Size) + 8
+		} else if chunk.ID == CIDAxml {
+			if err = DecodeAXMLChunk(d, chunk); err != nil {
+				return err
+			}
 			rewindBytes += int64(chunk.Size) + 8
 		} else {
 			// unexpected chunk order, might be a bext chunk
