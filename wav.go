@@ -34,7 +34,11 @@ func bytesNumFromDuration(dur time.Duration, sampleRate, bitDepth int) int {
 }
 
 func samplesNumFromDuration(dur time.Duration, sampleRate int) int {
-	return int(math.Floor(float64(dur / sampleDuration(sampleRate))))
+	d := sampleDuration(sampleRate)
+	if d == 0 {
+		return 0
+	}
+	return int(math.Floor(float64(dur / d)))
 }
 
 func sampleDuration(sampleRate int) time.Duration {

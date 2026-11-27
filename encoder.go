@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"time"
 
@@ -109,16 +110,25 @@ func (e *Encoder) addBuffer(buf *audio.IntBuffer) error {
 }
 
 func (e *Encoder) writeHeader() error {
-	if e.wroteHeader {
-		return errors.New("already wrote header")
-	}
-	e.wroteHeader = true
 	if e == nil {
 		return fmt.Errorf("can't write a nil encoder")
+	}
+	if e.wroteHeader {
+		return errors.New("already wrote header")
 	}
 	if e.w == nil {
 		return fmt.Errorf("can't write to a nil writer")
 	}
+	if e.SampleRate <= 0 {
+		return fmt.Errorf("%w: sample rate must be > 0", ErrInvalidFmtChunk)
+	}
+	if e.NumChans < 1 {
+		return fmt.Errorf("%w: num channels must be >= 1", ErrInvalidFmtChunk)
+	}
+	if e.BitDepth < 1 {
+		return fmt.Errorf("%w: bit depth must be > 0", ErrInvalidFmtChunk)
+	}
+	e.wroteHeader = true
 
 	if e.WrittenBytes > 0 {
 		return nil
@@ -175,7 +185,40 @@ func (e *Encoder) writeHeader() error {
 
 // Write encodes and writes the passed buffer to the underlying writer.
 // Don't forget to Close() the encoder or the file won't be valid.
-func (e *Encoder) Write(buf *audio.IntBuffer) error {
+//
+// Integer PCM buffers (*audio.IntBuffer) preserve the historical behavior.
+// Float buffers (*audio.Float32Buffer, *audio.FloatBuffer, []float32 or
+// []float64) are encoded as IEEE float samples and switch the fmt chunk to
+// format tag 3 / 32 bits.
+func (e *Encoder) Write(buf interface{}) error {
+	switch b := buf.(type) {
+	case nil:
+		return fmt.Errorf("can't add a nil buffer")
+	case *audio.IntBuffer:
+		return e.WriteIntBuffer(b)
+	case audio.IntBuffer:
+		return e.WriteIntBuffer(&b)
+	case *audio.Float32Buffer, audio.Float32Buffer,
+		*audio.FloatBuffer, audio.FloatBuffer,
+		[]float32, []float64:
+		return e.WriteFloat32(b)
+	default:
+		// Accept any other audio.Buffer through its Float32 view.
+		if ab, ok := buf.(audio.Buffer); ok {
+			return e.WriteFloat32(ab.AsFloat32Buffer())
+		}
+		return fmt.Errorf("wav: unsupported buffer type %T", buf)
+	}
+}
+
+// WriteInt encodes and writes an integer PCM buffer. It is the strongly typed
+// integer entry point equivalent of the historical Write method.
+func (e *Encoder) WriteInt(buf *audio.IntBuffer) error {
+	return e.WriteIntBuffer(buf)
+}
+
+// WriteIntBuffer encodes and writes the passed integer PCM buffer.
+func (e *Encoder) WriteIntBuffer(buf *audio.IntBuffer) error {
 	if !e.wroteHeader {
 		if err := e.writeHeader(); err != nil {
 			return err
@@ -201,8 +244,15 @@ func (e *Encoder) Write(buf *audio.IntBuffer) error {
 
 // WriteFrame writes a single frame of data to the underlying writer.
 func (e *Encoder) WriteFrame(value interface{}) error {
+	if f, ok := ieeeFloatScalar(value); ok {
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return fmt.Errorf("%w: WriteFrame", ErrInvalidFloatSample)
+		}
+	}
 	if !e.wroteHeader {
-		e.writeHeader()
+		if err := e.writeHeader(); err != nil {
+			return err
+		}
 	}
 	if !e.pcmChunkStarted {
 		// sound header
@@ -238,6 +288,15 @@ func (e *Encoder) writeMetadata() error {
 func (e *Encoder) Close() error {
 	if e == nil || e.w == nil {
 		return nil
+	}
+
+	// If no sample was ever written, still validate the parameters and emit
+	// the fmt/data headers so Close produces a recognizable (empty) WAV
+	// instead of patching an uninitialized header.
+	if !e.wroteHeader || !e.pcmChunkStarted {
+		if err := e.ieeeBeginDataChunk(); err != nil {
+			return err
+		}
 	}
 
 	// inject metadata at the end to not trip implementation not supporting

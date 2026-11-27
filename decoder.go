@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"time"
 
 	"github.com/go-audio/audio"
@@ -34,10 +35,19 @@ type Decoder struct {
 
 	AvgBytesPerSec uint32
 	WavAudioFormat uint16
+	// BlockAlign is the nBlockAlign fmt field (bytes per frame including
+	// all channels). It may be 0 if the fmt chunk hasn't been decoded.
+	BlockAlign uint16
 
 	err             error
 	PCMSize         int
 	pcmDataAccessed bool
+	// rawDataSize is the exact (pre RIFF word-padding) size of the data chunk
+	// as declared in its header.
+	rawDataSize int
+	// ieeeRawR is the persistent, raw-size bounded reader used by the float
+	// entry points.
+	ieeeRawR io.Reader
 	// pcmChunk is available so we can use the LimitReader
 	PCMChunk *riff.Chunk
 	// Metadata for the current file
@@ -70,6 +80,8 @@ func (d *Decoder) Rewind() error {
 	d.parser = riff.New(d.r)
 	d.pcmDataAccessed = false
 	d.PCMChunk = nil
+	d.ieeeRawR = nil
+	d.rawDataSize = 0
 	d.err = nil
 	d.NumChans = 0
 	err = d.FwdToPCM()
@@ -120,8 +132,20 @@ func (d *Decoder) IsValidFile() bool {
 	if d.NumChans < 1 {
 		return false
 	}
+	if d.SampleRate == 0 {
+		return false
+	}
 	if d.BitDepth < 8 {
 		return false
+	}
+	// IEEE float WAV files only define 32 and 64 bit sample widths.
+	if d.WavAudioFormat == FormatIEEEFloat && d.BitDepth != 32 && d.BitDepth != 64 {
+		return false
+	}
+	if d.BlockAlign != 0 && d.NumChans > 0 && d.BitDepth > 0 {
+		if want := d.NumChans * d.BitDepth / 8; d.BlockAlign != want {
+			return false
+		}
 	}
 	if d, err := d.Duration(); err != nil || d <= 0 {
 		return false
@@ -278,8 +302,28 @@ func (d *Decoder) FullPCMBuffer() (*audio.IntBuffer, error) {
 	return buf, err
 }
 
-// PCMBuffer populates the passed PCM buffer
-func (d *Decoder) PCMBuffer(buf *audio.IntBuffer) (n int, err error) {
+// PCMBuffer populates the passed PCM buffer.
+//
+// The historical *audio.IntBuffer path is unchanged. As a convenience,
+// *audio.Float32Buffer and *audio.FloatBuffer arguments are routed to the
+// corresponding IEEE float decoders (format tag 3).
+func (d *Decoder) PCMBuffer(buf interface{}) (n int, err error) {
+	switch b := buf.(type) {
+	case *audio.IntBuffer:
+		return d.pcmIntBuffer(b)
+	case *audio.Float32Buffer:
+		return d.Float32Buffer(b)
+	case *audio.FloatBuffer:
+		return d.FloatBuffer(b)
+	case nil:
+		return 0, nil
+	default:
+		return 0, fmt.Errorf("wav: unsupported PCMBuffer type %T", buf)
+	}
+}
+
+// pcmIntBuffer populates the passed integer PCM buffer.
+func (d *Decoder) pcmIntBuffer(buf *audio.IntBuffer) (n int, err error) {
 	if buf == nil {
 		return 0, nil
 	}
@@ -377,6 +421,12 @@ func (d *Decoder) NextChunk() (*riff.Chunk, error) {
 		return nil, d.err
 	}
 
+	// Keep the exact declared data chunk size, Decoder.NextChunk rounds odd
+	// sizes up to consume the RIFF padding byte below.
+	if id == riff.DataFormatID {
+		d.rawDataSize = int(size)
+	}
+
 	// TODO: any reason we don't use d.parser.NextChunk (riff.NextChunk) here?
 	// It correctly handles the misaligned chunk.
 
@@ -444,6 +494,7 @@ func (d *Decoder) readHeaders() error {
 			d.SampleRate = d.parser.SampleRate
 			d.WavAudioFormat = d.parser.WavAudioFormat
 			d.AvgBytesPerSec = d.parser.AvgBytesPerSec
+			d.BlockAlign = d.parser.BlockAlign
 
 			if rewindBytes > 0 {
 				d.r.Seek(-(rewindBytes + int64(chunk.Size) + 8), 1)
@@ -533,9 +584,14 @@ func sampleFloat64DecodeFunc(bitsPerSample int) (func([]byte) float64, error) {
 			return float64(output)
 		}, nil
 	case 4:
-		// TODO: fix the float64 conversion (current int implementation)
+		// 32bit IEEE float (WAVE format tag 3).
 		return func(s []byte) float64 {
-			return float64(int(s[0]) + int(s[1])<<8 + int(s[2])<<16 + int(s[3])<<24)
+			return float64(math.Float32frombits(binary.LittleEndian.Uint32(s[:4])))
+		}, nil
+	case 8:
+		// 64bit IEEE float.
+		return func(s []byte) float64 {
+			return math.Float64frombits(binary.LittleEndian.Uint64(s[:8]))
 		}, nil
 	default:
 		return nil, fmt.Errorf("unhandled byte depth:%d", bitsPerSample)
