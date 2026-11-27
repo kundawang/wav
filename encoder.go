@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"time"
 
@@ -37,6 +38,23 @@ type Encoder struct {
 	pcmChunkStarted bool
 	pcmChunkSizePos int
 	wroteHeader     bool // true if we've written the header out
+
+	// wave64 selects the Sony Wave64 container (GUIDs + 64 bit chunk sizes)
+	// instead of the classic 32 bit RIFF/WAVE layout. It is set by
+	// NewWave64Encoder.
+	wave64 bool
+	// dataSizePos records the offset of the Wave64 data chunk size field so
+	// it can be backfilled on Close.
+	dataSizePos int64
+	// closed is set by Close so a second call is a no-op instead of
+	// backfilling the size fields a second time.
+	closed bool
+}
+
+// bytesBufferFor preallocates the staging buffer used while serializing PCM
+// samples, roughly one minute of audio.
+func bytesBufferFor(sampleRate, bitDepth, numChans int) *bytes.Buffer {
+	return bytes.NewBuffer(make([]byte, 0, bytesNumFromDuration(time.Minute, sampleRate, bitDepth)*numChans))
 }
 
 // NewEncoder creates a new encoder to create a new wav file.
@@ -44,7 +62,7 @@ type Encoder struct {
 func NewEncoder(w io.WriteSeeker, sampleRate, bitDepth, numChans, audioFormat int) *Encoder {
 	return &Encoder{
 		w:              w,
-		buf:            bytes.NewBuffer(make([]byte, 0, bytesNumFromDuration(time.Minute, sampleRate, bitDepth)*numChans)),
+		buf:            bytesBufferFor(sampleRate, bitDepth, numChans),
 		SampleRate:     sampleRate,
 		BitDepth:       bitDepth,
 		NumChans:       numChans,
@@ -124,6 +142,10 @@ func (e *Encoder) writeHeader() error {
 		return nil
 	}
 
+	if e.wave64 {
+		return e.writeWave64Header()
+	}
+
 	// riff ID
 	if err := e.AddLE(riff.RiffID); err != nil {
 		return err
@@ -176,6 +198,9 @@ func (e *Encoder) writeHeader() error {
 // Write encodes and writes the passed buffer to the underlying writer.
 // Don't forget to Close() the encoder or the file won't be valid.
 func (e *Encoder) Write(buf *audio.IntBuffer) error {
+	if buf == nil {
+		return fmt.Errorf("can't add a nil buffer")
+	}
 	if !e.wroteHeader {
 		if err := e.writeHeader(); err != nil {
 			return err
@@ -183,6 +208,12 @@ func (e *Encoder) Write(buf *audio.IntBuffer) error {
 	}
 
 	if !e.pcmChunkStarted {
+		if e.wave64 {
+			if err := e.startWave64PCMChunk(); err != nil {
+				return err
+			}
+			return e.addBuffer(buf)
+		}
 		// sound header
 		if err := e.AddLE(riff.DataFormatID); err != nil {
 			return fmt.Errorf("error encoding sound header %w", err)
@@ -202,19 +233,27 @@ func (e *Encoder) Write(buf *audio.IntBuffer) error {
 // WriteFrame writes a single frame of data to the underlying writer.
 func (e *Encoder) WriteFrame(value interface{}) error {
 	if !e.wroteHeader {
-		e.writeHeader()
+		if err := e.writeHeader(); err != nil {
+			return err
+		}
 	}
 	if !e.pcmChunkStarted {
-		// sound header
-		if err := e.AddLE(riff.DataFormatID); err != nil {
-			return fmt.Errorf("error encoding sound header %w", err)
-		}
-		e.pcmChunkStarted = true
+		if e.wave64 {
+			if err := e.startWave64PCMChunk(); err != nil {
+				return err
+			}
+		} else {
+			// sound header
+			if err := e.AddLE(riff.DataFormatID); err != nil {
+				return fmt.Errorf("error encoding sound header %w", err)
+			}
+			e.pcmChunkStarted = true
 
-		// write a temporary chunksize
-		e.pcmChunkSizePos = e.WrittenBytes
-		if err := e.AddLE(uint32(42)); err != nil {
-			return fmt.Errorf("%w when writing wav data chunk size header", err)
+			// write a temporary chunksize
+			e.pcmChunkSizePos = e.WrittenBytes
+			if err := e.AddLE(uint32(42)); err != nil {
+				return fmt.Errorf("%w when writing wav data chunk size header", err)
+			}
 		}
 	}
 
@@ -239,6 +278,14 @@ func (e *Encoder) Close() error {
 	if e == nil || e.w == nil {
 		return nil
 	}
+	if e.closed {
+		return nil
+	}
+	e.closed = true
+
+	if e.wave64 {
+		return e.closeWave64()
+	}
 
 	// inject metadata at the end to not trip implementation not supporting
 	// metadata chunks
@@ -261,7 +308,10 @@ func (e *Encoder) Close() error {
 		if _, err := e.w.Seek(int64(e.pcmChunkSizePos), 0); err != nil {
 			return err
 		}
-		chunksize := uint32((int(e.BitDepth) / 8) * int(e.NumChans) * e.frames)
+		chunksize := uint64((int(e.BitDepth) / 8) * int(e.NumChans) * e.frames)
+		if chunksize > math.MaxUint32 {
+			return fmt.Errorf("PCM data of %d bytes overflows the RIFF 32 bit chunk size, use a Wave64 encoder: %w", chunksize, ErrWave64Overflow)
+		}
 		if err := e.AddLE(uint32(chunksize)); err != nil {
 			return fmt.Errorf("%w when writing wav data chunk size header", err)
 		}
@@ -274,6 +324,76 @@ func (e *Encoder) Close() error {
 	switch e.w.(type) {
 	case *os.File:
 		return e.w.(*os.File).Sync()
+	}
+	return nil
+}
+
+// closeWave64 backfills the 64 bit RIFF and data chunk sizes, emitting an
+// empty (but valid) data chunk when no audio frame was ever written.
+func (e *Encoder) closeWave64() error {
+	if e.Metadata != nil {
+		return ErrWave64Metadata
+	}
+
+	if !e.wroteHeader {
+		if err := e.writeHeader(); err != nil {
+			return err
+		}
+	}
+	if !e.pcmChunkStarted {
+		// empty audio: still emit a data chunk so the file stays valid.
+		if err := e.startWave64PCMChunk(); err != nil {
+			return err
+		}
+	}
+
+	dataChunkSize, err := wave64DataSize(e.frames, e.NumChans, e.BitDepth)
+	if err != nil {
+		return err
+	}
+
+	payloadSize := uint64(e.BitDepth/8) * uint64(e.NumChans) * uint64(e.frames)
+	if padding := wave64Padding(payloadSize); padding > 0 {
+		// PCM chunks must end on an 8 byte boundary; pad with zero bytes.
+		zero := [wave64Alignment]byte{}
+		if err := e.addRaw(zero[:padding]); err != nil {
+			return err
+		}
+	}
+
+	// Capture the RIFF size before backfilling anything: the patch helpers do
+	// not count overwritten bytes in WrittenBytes, and the size fields must
+	// reflect the real file length.
+	// In Wave64 the chunk size includes the chunk header itself (GUID + size
+	// field), so the RIFF size equals the total file length.
+	riffSize := uint64(e.WrittenBytes)
+	if riffSize < dataChunkSize {
+		return ErrWave64Overflow
+	}
+
+	// Backfill the data chunk size (includes its own 24 byte header).
+	if _, err := e.w.Seek(e.dataSizePos, io.SeekStart); err != nil {
+		return err
+	}
+	if err := e.patchLE64(dataChunkSize); err != nil {
+		return fmt.Errorf("%w when writing Wave64 data chunk size header", err)
+	}
+
+	// Backfill the RIFF size.
+	if _, err := e.w.Seek(int64(wave64GUIDSize), io.SeekStart); err != nil {
+		return err
+	}
+	if err := e.patchLE64(riffSize); err != nil {
+		return fmt.Errorf("%w when writing the Wave64 total size", err)
+	}
+
+	// jump back to the end of the file.
+	if _, err := e.w.Seek(0, io.SeekEnd); err != nil {
+		return err
+	}
+	switch f := e.w.(type) {
+	case *os.File:
+		return f.Sync()
 	}
 	return nil
 }
