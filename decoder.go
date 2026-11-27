@@ -41,6 +41,15 @@ type Decoder struct {
 	pcmDataAccessed bool
 	// pcmChunk is available so we can use the LimitReader
 	PCMChunk *riff.Chunk
+	// wavl is true when the RIFF form type is "wavl" (Wave List). In that
+	// case the PCM stream is synthesized from an ordered sequence of "data"
+	// and "slnt" chunks instead of being read from a single data chunk.
+	wavl       bool
+	wavlParts  []wavlPart
+	wavlReader *wavlStream
+	// rawChunkSize is the unpadded declared size of the chunk most recently
+	// returned by nextWavlChunk (used by the wavl scanner).
+	rawChunkSize int
 	// Metadata for the current file
 	Metadata *Metadata
 }
@@ -62,21 +71,31 @@ func (d *Decoder) Seek(offset int64, whence int) (int64, error) {
 // Rewind allows the decoder to be rewound to the beginning of the PCM data.
 // This is useful if you want to keep on decoding the same file in a loop.
 func (d *Decoder) Rewind() error {
+	if err := d.resetToChunks(); err != nil {
+		return err
+	}
+	if err := d.FwdToPCM(); err != nil {
+		return fmt.Errorf("failed to seek to the PCM data: %w", err)
+	}
+	return nil
+}
 
-	_, err := d.r.Seek(0, io.SeekStart)
-	if err != nil {
+// resetToChunks seeks the underlying reader back to the start of the
+// container, rebuilds the parser and clears the per-pass decoder state so the
+// chunk stream can be walked again.
+func (d *Decoder) resetToChunks() error {
+	if _, err := d.r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("failed to seek back to the start %w", err)
 	}
-	// we have to user a new parser since it's read only and can't be seeked
+	// we have to use a new parser since it's read only and can't be seeked
 	d.parser = riff.New(d.r)
 	d.pcmDataAccessed = false
 	d.PCMChunk = nil
 	d.err = nil
 	d.NumChans = 0
-	err = d.FwdToPCM()
-	if err != nil {
-		return fmt.Errorf("failed to seek to the PCM data: %w", err)
-	}
+	d.wavl = false
+	d.wavlParts = nil
+	d.wavlReader = nil
 	return nil
 }
 
@@ -191,13 +210,22 @@ func (d *Decoder) ReadMetadata() {
 
 // FwdToPCM forwards the underlying reader until the start of the PCM chunk.
 // If the PCM chunk was already read, no data will be found (you need to rewind).
+//
+// For "wavl" (Wave List) containers there is no single PCM chunk: the method
+// scans the whole ordered sequence of "data" and "slnt" chunks, rewinds the
+// reader and prepares an internal stream that merges them in order so the
+// regular PCM read entry points (PCMBuffer, FullPCMBuffer) work unchanged.
 func (d *Decoder) FwdToPCM() error {
 	if d == nil {
 		return fmt.Errorf("PCM data not found")
 	}
 	d.err = d.readHeaders()
 	if d.err != nil {
-		return nil
+		return d.err
+	}
+
+	if d.wavl {
+		return d.fwdToWavlPCM()
 	}
 
 	var chunk *riff.Chunk
@@ -224,12 +252,54 @@ func (d *Decoder) FwdToPCM() error {
 	return nil
 }
 
+// fwdToWavlPCM scans the wavl chunk sequence, then rewinds the reader and
+// builds the merging stream used by the PCM read entry points.
+func (d *Decoder) fwdToWavlPCM() error {
+	parts, pcmSize, err := d.scanWavl()
+	if err != nil {
+		d.err = err
+		return err
+	}
+	if err = d.resetToChunks(); err != nil {
+		d.err = err
+		return err
+	}
+	// readHeaders again and skip straight past it to the first sub chunk.
+	if err = d.readHeaders(); err != nil {
+		d.err = err
+		return err
+	}
+	d.wavl = true
+	d.wavlParts = parts
+	d.PCMSize = pcmSize
+	d.wavlReader, err = d.newWavlStream(parts)
+	if err != nil {
+		d.err = err
+		return err
+	}
+	d.pcmDataAccessed = true
+	return nil
+}
+
 // WasPCMAccessed returns positively if the PCM data was previously accessed.
 func (d *Decoder) WasPCMAccessed() bool {
 	if d == nil {
 		return false
 	}
 	return d.pcmDataAccessed
+}
+
+// pcmReader returns the reader backing the PCM stream. It is either the
+// limited reader of the single top level "data" chunk (regular WAVE files) or
+// the internal stream merging the "data"/"slnt" chunks of a wavl file.
+func (d *Decoder) pcmReader() io.Reader {
+	if d.wavl {
+		return d.wavlReader
+	}
+	if d.PCMChunk == nil {
+		return nil
+	}
+	return d.PCMChunk.R
 }
 
 // FullPCMBuffer is an inefficient way to access all the PCM data contained in the
@@ -242,7 +312,8 @@ func (d *Decoder) FullPCMBuffer() (*audio.IntBuffer, error) {
 			return nil, d.err
 		}
 	}
-	if d.PCMChunk == nil {
+	r := d.pcmReader()
+	if r == nil {
 		return nil, errors.New("PCM chunk not found")
 	}
 	format := &audio.Format{
@@ -251,8 +322,7 @@ func (d *Decoder) FullPCMBuffer() (*audio.IntBuffer, error) {
 	}
 
 	buf := &audio.IntBuffer{Data: make([]int, 4096), Format: format, SourceBitDepth: int(d.BitDepth)}
-	bytesPerSample := (d.BitDepth-1)/8 + 1
-	sampleBufData := make([]byte, bytesPerSample)
+	sampleBufData := make([]byte, bytesPerSample(int(d.BitDepth)))
 	decodeF, err := sampleDecodeFunc(int(d.BitDepth))
 	if err != nil {
 		return nil, fmt.Errorf("could not get sample decode func %w", err)
@@ -260,7 +330,7 @@ func (d *Decoder) FullPCMBuffer() (*audio.IntBuffer, error) {
 
 	i := 0
 	for err == nil {
-		buf.Data[i], err = decodeF(d.PCMChunk, sampleBufData)
+		buf.Data[i], err = decodeF(r, sampleBufData)
 		if err != nil {
 			break
 		}
@@ -291,7 +361,8 @@ func (d *Decoder) PCMBuffer(buf *audio.IntBuffer) (n int, err error) {
 			return 0, d.err
 		}
 	}
-	if d.PCMChunk == nil {
+	r := d.pcmReader()
+	if r == nil {
 		return 0, ErrPCMChunkNotFound
 	}
 
@@ -312,12 +383,18 @@ func (d *Decoder) PCMBuffer(buf *audio.IntBuffer) (n int, err error) {
 	size := len(buf.Data) * bPerSample
 	tmpBuf := make([]byte, size)
 	var m int
-	m, err = d.PCMChunk.R.Read(tmpBuf)
+	// io.ReadFull keeps reading across underlying chunk boundaries, which is
+	// required for wavl streams that chain multiple data/slnt chunks.
+	m, err = io.ReadFull(r, tmpBuf)
 	if err != nil {
-		if errors.Is(err, io.EOF) {
-			return m, nil
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			if m == 0 {
+				return 0, nil
+			}
+			err = nil
+		} else {
+			return m, err
 		}
-		return m, err
 	}
 	if m == 0 {
 		return m, nil
@@ -363,7 +440,7 @@ func (d *Decoder) Format() *audio.Format {
 // NextChunk returns the next available chunk
 func (d *Decoder) NextChunk() (*riff.Chunk, error) {
 	if d.err = d.readHeaders(); d.err != nil {
-		d.err = fmt.Errorf("failed to read header - %v", d.err)
+		d.err = fmt.Errorf("failed to read header: %w", d.err)
 		return nil, d.err
 	}
 
@@ -374,7 +451,9 @@ func (d *Decoder) NextChunk() (*riff.Chunk, error) {
 
 	id, size, d.err = d.parser.IDnSize()
 	if d.err != nil {
-		d.err = fmt.Errorf("error reading chunk header - %v", d.err)
+		// Preserve the underlying error (io.EOF in particular) so callers
+		// can detect the end of the chunk stream with errors.Is.
+		d.err = fmt.Errorf("error reading chunk header: %w", d.err)
 		return nil, d.err
 	}
 
@@ -402,6 +481,21 @@ func (d *Decoder) Duration() (time.Duration, error) {
 	if d == nil || d.parser == nil {
 		return 0, errors.New("can't calculate the duration of a nil pointer")
 	}
+	// The generic riff parser only knows the "WAVE" form type and bases the
+	// duration on the RIFF container size. A "wavl" container's size ignores
+	// the silence synthesized from slnt chunks and the parser does not know
+	// the form type at all, so compute the duration from the format fields.
+	if d.wavl {
+		if d.AvgBytesPerSec == 0 {
+			return 0, errors.New("can't calculate the wavl duration without format info")
+		}
+		if d.pcmDataAccessed {
+			return time.Duration(float64(d.PCMSize) / float64(d.AvgBytesPerSec) * float64(time.Second)), nil
+		}
+		// Fallback used before FwdToPCM ran (e.g. IsValidFile): estimate from
+		// the container size, which is a positive lower bound of the duration.
+		return time.Duration(float64(d.parser.Size) / float64(d.AvgBytesPerSec) * float64(time.Second)), nil
+	}
 	return d.parser.Duration()
 }
 
@@ -428,6 +522,7 @@ func (d *Decoder) readHeaders() error {
 	if err := binary.Read(d.r, binary.BigEndian, &d.parser.Format); err != nil {
 		return err
 	}
+	d.wavl = d.parser.Format == CIDWavl
 
 	var chunk *riff.Chunk
 	var rewindBytes int64
