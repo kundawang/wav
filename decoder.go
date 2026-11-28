@@ -36,6 +36,13 @@ type Decoder struct {
 	AvgBytesPerSec uint32
 	WavAudioFormat uint16
 
+	// lastChunkSize is the raw (unpadded) size of the chunk header most
+	// recently read by NextChunk.
+	lastChunkSize int
+	// pcmDataSize is the unpadded size of the PCM data chunk. It differs from
+	// PCMSize when the chunk has an odd size and is followed by a padding byte.
+	pcmDataSize int
+
 	err             error
 	PCMSize         int
 	pcmDataAccessed bool
@@ -43,6 +50,23 @@ type Decoder struct {
 	PCMChunk *riff.Chunk
 	// Metadata for the current file
 	Metadata *Metadata
+
+	// msFmt contains the Microsoft ADPCM fmt chunk extension, when the
+	// stream uses that format.
+	msFmt *msADPCMFmt
+	// msFactSet/msFactFrames hold the frame count from the fact chunk.
+	msFactSet    bool
+	msFactFrames int64
+	// msFactErr records a fact chunk that couldn't be parsed. It is only
+	// reported if the fact chunk is needed to decode the stream, so that a
+	// malformed fact chunk doesn't break the decoding of formats that don't
+	// use it (such as linear PCM).
+	msFactErr error
+	// msState is the streaming state of the Microsoft ADPCM decoder.
+	msState *msADPCMState
+	// headerErr latches a header parsing failure so that later readHeaders
+	// calls don't silently succeed with partially populated fields.
+	headerErr error
 }
 
 // NewDecoder creates a decoder for the passed wav reader.
@@ -71,8 +95,17 @@ func (d *Decoder) Rewind() error {
 	d.parser = riff.New(d.r)
 	d.pcmDataAccessed = false
 	d.PCMChunk = nil
+	d.PCMSize = 0
+	d.pcmDataSize = 0
+	d.lastChunkSize = 0
 	d.err = nil
 	d.NumChans = 0
+	d.msFmt = nil
+	d.msFactSet = false
+	d.msFactFrames = 0
+	d.msFactErr = nil
+	d.msState = nil
+	d.headerErr = nil
 	err = d.FwdToPCM()
 	if err != nil {
 		return fmt.Errorf("failed to seek to the PCM data: %w", err)
@@ -121,7 +154,11 @@ func (d *Decoder) IsValidFile() bool {
 	if d.NumChans < 1 {
 		return false
 	}
-	if d.BitDepth < 8 {
+	if d.WavAudioFormat == WavAudioFormatMSADPCM {
+		if d.msFmt == nil || d.BitDepth != 4 {
+			return false
+		}
+	} else if d.BitDepth < 8 {
 		return false
 	}
 	if d, err := d.Duration(); err != nil || d <= 0 {
@@ -197,6 +234,9 @@ func (d *Decoder) FwdToPCM() error {
 	}
 	d.err = d.readHeaders()
 	if d.err != nil {
+		// Preserve the historical behavior: the parse error stays available
+		// through Err(), and the caller reports a missing PCM chunk. For MS
+		// ADPCM the specific header error is surfaced when decoding starts.
 		return nil
 	}
 
@@ -208,11 +248,20 @@ func (d *Decoder) FwdToPCM() error {
 		}
 		if chunk.ID == riff.DataFormatID {
 			d.PCMSize = chunk.Size
+			// The chunk size is padded to an even number of bytes, but the
+			// padding byte is not part of the PCM data.
+			d.pcmDataSize = d.lastChunkSize
 			d.PCMChunk = chunk
+			d.msState = nil
 			break
 		}
 		if chunk.ID == CIDList {
 			DecodeListChunk(d, chunk)
+		}
+		if chunk.ID == CIDFact {
+			if err := d.decodeFactChunk(chunk); err != nil {
+				d.msFactErr = err
+			}
 		}
 		chunk.Drain()
 	}
@@ -244,6 +293,9 @@ func (d *Decoder) FullPCMBuffer() (*audio.IntBuffer, error) {
 	}
 	if d.PCMChunk == nil {
 		return nil, errors.New("PCM chunk not found")
+	}
+	if d.WavAudioFormat == WavAudioFormatMSADPCM {
+		return d.fullPCMBufferMSADPCM()
 	}
 	format := &audio.Format{
 		NumChannels: int(d.NumChans),
@@ -293,6 +345,9 @@ func (d *Decoder) PCMBuffer(buf *audio.IntBuffer) (n int, err error) {
 	}
 	if d.PCMChunk == nil {
 		return 0, ErrPCMChunkNotFound
+	}
+	if d.WavAudioFormat == WavAudioFormatMSADPCM {
+		return d.pcmBufferMSADPCM(buf)
 	}
 
 	format := &audio.Format{
@@ -381,10 +436,10 @@ func (d *Decoder) NextChunk() (*riff.Chunk, error) {
 	// TODO: any reason we don't use d.parser.NextChunk (riff.NextChunk) here?
 	// It correctly handles the misaligned chunk.
 
-	// TODO: copied over from riff.parser.NextChunk
 	// all RIFF chunks (including WAVE "data" chunks) must be word aligned.
 	// If the data uses an odd number of bytes, a padding byte with a value of zero must be placed at the end of the sample data.
 	// The "data" chunk header's size should not include this byte.
+	d.lastChunkSize = int(size)
 	if size%2 == 1 {
 		size++
 	}
@@ -412,7 +467,13 @@ func (d *Decoder) String() string {
 
 // readHeaders is safe to call multiple times
 func (d *Decoder) readHeaders() error {
-	if d == nil || d.NumChans > 0 {
+	if d == nil {
+		return nil
+	}
+	if d.headerErr != nil {
+		return d.headerErr
+	}
+	if d.NumChans > 0 {
 		return nil
 	}
 
@@ -439,12 +500,10 @@ func (d *Decoder) readHeaders() error {
 		}
 
 		if chunk.ID == riff.FmtID {
-			chunk.DecodeWavHeader(d.parser)
-			d.NumChans = d.parser.NumChannels
-			d.BitDepth = d.parser.BitsPerSample
-			d.SampleRate = d.parser.SampleRate
-			d.WavAudioFormat = d.parser.WavAudioFormat
-			d.AvgBytesPerSec = d.parser.AvgBytesPerSec
+			if err := d.decodeFmtChunk(chunk); err != nil {
+				d.headerErr = err
+				return err
+			}
 
 			if rewindBytes > 0 {
 				d.r.Seek(-(rewindBytes + int64(chunk.Size) + 8), 1)
@@ -459,6 +518,11 @@ func (d *Decoder) readHeaders() error {
 			rewindBytes += int64(chunk.Size) + 8
 		} else if chunk.ID == CIDSmpl {
 			DecodeSamplerChunk(d, chunk)
+			rewindBytes += int64(chunk.Size) + 8
+		} else if chunk.ID == CIDFact {
+			if err := d.decodeFactChunk(chunk); err != nil {
+				d.msFactErr = err
+			}
 			rewindBytes += int64(chunk.Size) + 8
 		} else {
 			// unexpected chunk order, might be a bext chunk
